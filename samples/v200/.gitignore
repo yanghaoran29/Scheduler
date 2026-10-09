@@ -1,0 +1,14 @@
+*.so
+*.o
+*.bin
+*.pyc
+__pycache__/
+cache/
+outputs/
+build_output/
+build_outputs/
+dfx_outputs/
+data/
+report/
+*.log
+captures/
