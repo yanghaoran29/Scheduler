@@ -1,0 +1,697 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>5× AICore Tiling 文档合集</title>
+<style>
+
+:root{--bg:#fafafa;--txt:#222;--muted:#666;--line:#e5e5e5;--panel:#fff;--aic:#2563eb}
+*{box-sizing:border-box}
+body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+  background:var(--bg);color:var(--txt);line-height:1.65;font-size:15px}
+.wrap{max-width:980px;margin:0 auto;padding:28px 20px 72px}
+h1{font-size:26px;margin:0 0 8px}
+h2{font-size:20px;margin:36px 0 10px;padding-bottom:6px;border-bottom:1px solid var(--line)}
+h3{font-size:16px;margin:22px 0 8px}
+h4{font-size:15px;margin:18px 0 6px}
+.lead,.note{color:var(--muted);font-size:14px}
+a{color:var(--aic);text-decoration:none}
+a:hover{text-decoration:underline}
+code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:0.92em;background:#f3f4f6;padding:1px 5px;border-radius:4px}
+pre{background:#f3f4f6;border:1px solid var(--line);border-radius:8px;padding:12px 14px;overflow-x:auto;font-size:13px;line-height:1.45}
+pre code{background:transparent;padding:0}
+.table-wrap{overflow-x:auto;margin:12px 0 18px}
+table.data{border-collapse:collapse;width:100%;font-size:13.5px;background:var(--panel)}
+table.data th,table.data td{border:1px solid var(--line);padding:7px 10px;text-align:left;vertical-align:top}
+table.data th{background:#f3f4f6;font-weight:600}
+ul,ol{padding-left:1.4em}
+li{margin:4px 0}
+.toc{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px 18px;margin:18px 0 28px}
+.toc h2{margin-top:0;border:none;padding:0;font-size:16px}
+.toc ol{margin:8px 0 0}
+.toc li{margin:3px 0}
+.doc-banner{background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;padding:10px 14px;margin:12px 0 18px;font-size:14px;color:#1e3a5f}
+details.fold-table{margin:12px 0 18px;border:1px solid var(--line);border-radius:8px;background:var(--panel);padding:0 12px 4px}
+details.fold-table>summary{cursor:pointer;padding:10px 4px;font-weight:600;color:var(--aic);list-style-position:outside}
+details.fold-table[open]>summary{border-bottom:1px solid var(--line);margin-bottom:8px}
+footer.page-foot{margin-top:48px;padding-top:16px;border-top:1px solid var(--line);color:var(--muted);font-size:13px}
+.sec{margin-top:8px}
+
+</style>
+</head>
+<body>
+<div class="wrap">
+<h1>5× AICore Tiling 文档合集</h1>
+<p class="lead">面向 AICore 24→120 的 Qwen3 / DeepSeek CSA 切分方案、静态分析与详版风险说明。长表格默认折叠。</p>
+
+<nav class="toc" id="toc">
+<h2>目录</h2>
+<ol>
+  <li><a href="#method">这个数是怎么算的</a></li>
+  <li><a href="#doc-a">文档 A：5× AICore 并行切分方案</a></li>
+  <li><a href="#doc-b">文档 B：120 AICore 静态分析与修改方案</a></li>
+  <li><a href="#doc-c">文档 C：Qwen3 / CSA 详版（中文译文）</a></li>
+</ol>
+</nav>
+
+
+<section id="method">
+<h2>这个数是怎么算的</h2>
+<p class="note">本页是设计/分析文档的整理页，<strong>不是</strong>脚本扫仓自动生成的报表。分块数字分三类，不要混读。</p>
+
+<div class="table-wrap">
+<table class="data">
+<thead><tr><th>列 / 数字类型</th><th>含义</th><th>怎么得到</th></tr></thead>
+<tbody>
+<tr>
+<td><strong>当前逻辑分块 / 当前 BlockDim</strong></td>
+<td>改参前 <code>main</code> 默认构图</td>
+<td>读源码 tiling 常量<strong>手算</strong>。例如 Qwen <code>out_proj</code>：<code>N_SPLITS_OUT × K_SPLITS_OUT = 10 × 5 = 50</code>；Attention：<code>ATTN_SPMD_BLOCKS=24</code>；CSA 默认 <code>T=B×S=4×2=8</code>。</td>
+</tr>
+<tr>
+<td><strong>目标逻辑分块 / 目标 BlockDim</strong></td>
+<td>面向 120 AIC 的方案</td>
+<td><strong>设计取值</strong>（改哪个 tile 常量、为何选 N 不选 K），不是上板测量值。</td>
+</tr>
+<tr>
+<td><strong>验证占用 / span / golden</strong></td>
+<td>24 AIC 设备上的实测</td>
+<td>来自 <code>deps.json</code> + 四级泳道；<strong>不能</strong>反推「目标分块」表。120 AIC 目标机性能仍需另采。</td>
+</tr>
+</tbody>
+</table>
+</div>
+
+<h3>术语</h3>
+<ul>
+<li><code>BlockDim</code>：一次任务调用启动的并行 Block 数；普通 <code>pl.at</code> 的 BlockDim 为 1。</li>
+<li><strong>逻辑分块总数</strong>：该算子全部工作块，可跨多次 <code>pl.at</code> / <code>pl.spmd</code>，不等于同时在跑。</li>
+<li><strong>切分 Batch</strong>：是 = block 索引含 Batch/Token；否 = 每 block 处理完整 Batch tile；间接 = 表达式含行组但本次不切该维。</li>
+</ul>
+
+<h3>常用公式例</h3>
+<pre><code>Qwen out_proj（基线）:  N_SPLITS_OUT × K_SPLITS_OUT = 10 × 5 = 50
+Qwen out_proj（目标）:  20 × 5 = 100
+Qwen Attention 工作项: active_batch × NUM_KV_HEADS = 16 × 8 = 128
+Qwen gate/up:          17 × 5 = 85
+CSA qk_pv（目标）:     T × SPARSE_BLOCKS = 8 × 5 = 40
+CSA score（目标）:     T × REDUCE_NSPLIT = 8 × 10 = 80
+CSA proj_a「8×16」:    8 次调用 × 每次 BlockDim 16（≠ 一次 BlockDim 128）</code></pre>
+
+<p class="note">长表格默认折叠，点击「展开：…」查看全表。本页不含 V200 <code>granularity/case_*.md</code> 的 AIC/AIV/MIX 耗时统计；上板样例见 <a href="../../samples/v200/README.md">samples/v200</a>，sim120 生成见仓库根 <a href="../../README.md">README</a>。</p>
+</section>
+
+
+<section class="sec" id="doc-a">
+<h2>文档 A：5× AICore 并行切分方案</h2>
+<div class="doc-banner">源文件：工作区根目录 <code>AICORE_5X_TILING_PLAN.md</code>（中文原文）。</div>
+<h3>1. 目标与范围</h3>
+<p>本方案面向 AICore 数量由 24 增加到 120 的机器，模型规格保持代码仓默认值，不调整隐藏维度、Head 数、Batch 上限或序列长度。</p>
+<ul>
+<li>Qwen3：<code>models/qwen3_14b/decode_fwd.py::_decode_layer</code></li>
+<li>DeepSeek CSA：<code>models/deepseek_v4_flash_mtp/decode_csa.py</code></li>
+<li>基线：当前 <code>main</code>，提交 <code>c3f0dea274f55d9648920f17c968e8564ae9fcdc</code></li>
+</ul>
+<p>文中的“BlockDim”指一次任务调用启动的并行 Block 数；普通 <code>pl.at</code> 任务的 BlockDim 为 1。表中的“逻辑分块总数”用于描述同一算子的所有工作块，不代表这些块一定属于同一次任务调用或一定能同时运行。</p>
+<p>Batch 标记含义：</p>
+<ul>
+<li><strong>是</strong>：Block 索引显式包含 Batch/Token 维度，Batch 大小会影响有效工作项数量或并行度。</li>
+<li><strong>否</strong>：每个 Block 都处理完整的 Batch tile，新增并行度来自 N、K、Head 等非 Batch 维度。</li>
+<li><strong>间接</strong>：表达式包含行组，但本次修改不切分该维度；默认规格下通常只有一个行组。</li>
+</ul>
+<h3>2. Qwen3 方案</h3>
+<h4>2.1 最终建议</h4>
+<details class="fold-table"><summary>展开：长表格（任务 / 当前逻辑分块 / 目标逻辑分块，共 11 行）</summary>
+<div class="table-wrap"><table class="data"><thead><tr><th>任务</th><th>当前逻辑分块</th><th>目标逻辑分块</th><th>主要切分维度</th><th>切分 Batch</th><th>结论</th></tr></thead><tbody><tr><td><code>q_proj</code></td><td>50</td><td>50</td><td>N × Split-K：<code>10 × 5</code></td><td>否</td><td>保持</td></tr><tr><td><code>k_proj</code></td><td>10</td><td>10</td><td>N × Split-K：<code>2 × 5</code></td><td>否</td><td>保持</td></tr><tr><td><code>v_proj</code></td><td>10</td><td>10</td><td>N × Split-K：<code>2 × 5</code></td><td>否</td><td>保持</td></tr><tr><td><code>attn_swpipe_spmd</code></td><td>BlockDim 24</td><td>BlockDim 120</td><td>Batch × KV Head 工作项</td><td><strong>是</strong></td><td>调整</td></tr><tr><td><code>out_proj</code></td><td>50</td><td>100</td><td>N × Split-K：<code>20 × 5</code></td><td>否</td><td>调整</td></tr><tr><td><code>gate_proj</code></td><td>85</td><td>85</td><td>N × Split-K：<code>17 × 5</code></td><td>否</td><td>保持</td></tr><tr><td><code>up_proj</code></td><td>85</td><td>85</td><td>N × Split-K：<code>17 × 5</code></td><td>否</td><td>保持</td></tr><tr><td><code>down_proj</code></td><td>85</td><td>85</td><td>N × K 分块</td><td>否</td><td>保持</td></tr><tr><td><code>x_gamma0</code></td><td>BlockDim 5</td><td>BlockDim 5</td><td>Hidden</td><td>否</td><td>保持</td></tr><tr><td><code>silu</code></td><td>17 个普通任务</td><td>17 个普通任务</td><td>Intermediate N</td><td>否</td><td>保持</td></tr><tr><td><code>dcr_xgamma</code></td><td>BlockDim 5</td><td>BlockDim 5</td><td>Hidden N</td><td>否</td><td>保持</td></tr></tbody></table></div>
+</details>
+<h4>2.2 Q/K/V 保持 <code>50/10/10</code> 的原因</h4>
+<p>Q、K、V 的输出计算量约为 <code>5:1:1</code>。当前任务数也是 <code>50:10:10</code>，所以三类任务的单 Block 工作量接近一致。</p>
+<p>如果只把 Q 改成 100：</p>
+<ul>
+<li>Q 的单 Block 工作量减半，但 K/V 仍是原来的长任务；</li>
+<li><code>100 + 10 + 10 = 120</code> 只是在数量上填满 120 核，并不代表工作量均衡；</li>
+<li>QKV 汇合点可能继续等待 K/V 长尾；</li>
+<li>更多 Q Block 还可能占用 K/V 的调度窗口。</li>
+</ul>
+<p>因此第一版保持 <code>Q/K/V = 50/10/10</code>。只有目标机泳道图证明 <code>q_proj</code> 是独立关键路径、且 K/V 被完全隐藏时，才单独试验 <code>100/10/10</code>。如果整个 QKV 阶段都需要加速，应按相同粒度同步切分，例如 <code>100/20/20</code>，但该方案共有 140 个 Block，会在 120 核上形成第二波，不能作为默认首选。</p>
+<h4>2.3 Attention：<code>24 → 120</code></h4>
+<p>修改位置：<code>models/qwen3_14b/paged_attention_pypto.py</code>。</p>
+<pre class="lang-text"><code>ATTN_SPMD_BLOCKS: 24 -&gt; 120</code></pre>
+<p>默认单个 Batch window 最多有：</p>
+<pre class="lang-text"><code>active_batch × NUM_KV_HEADS = 16 × 8 = 128 个逻辑工作项</code></pre>
+<p>BlockDim 120 时，前 8 个 lane 各执行两个工作项，其余 lane 各执行一个工作项。这里明确切分了 Batch × KV Head；实际 Batch 小于 15 时，逻辑工作项少于 120，部分 AICore 会空闲。是否提高 Batch，应根据目标服务负载决定，不能为了填核直接修改模型默认 Batch。</p>
+<p>需要同步检查依赖于 <code>ATTN_SPMD_BLOCKS</code> 的 transfer/workspace 尺寸，特别是 <code>TRANSFER_ROWS</code>，不能只替换 BlockDim 常量。</p>
+<h4>2.4 Out Projection：<code>50 → 100</code></h4>
+<p>推荐沿 N 维加倍，不增加 Split-K：</p>
+<pre class="lang-text"><code>N_SPLITS_OUT: 10 -&gt; 20
+K_SPLITS_OUT: 5  -&gt; 5
+OUT_TN:       512 -&gt; 256
+OUT_TK:       1024（保持）
+总分块:       10×5=50 -&gt; 20×5=100</code></pre>
+<p>选择 N 维而不是 K 维的原因：</p>
+<ul>
+<li>Split-K 保持 5，避免把 atomic-add 扇入从 5 增加到 10；</li>
+<li>减少 atomic 竞争和浮点累加顺序变化风险；</li>
+<li><code>[BATCH_PAD, OUT_TN]</code> 累加器从 512 列降到 256 列，片上空间压力更低；</li>
+<li>每个 Block 仍处理完整 <code>BATCH_PAD</code>，没有切分 Batch。</li>
+</ul>
+<p>当前实现把 50 个逻辑块组织为 26 个普通任务和一个 BlockDim 24 的直接 SPMD 任务，这是调度优先级设计，不是矩阵形状要求。目标版本不应简单保留 <code>76 个普通任务 + BlockDim 24</code>，否则 Attention 完成后的第一波仍只有 24 个直接块。建议分两步实施：</p>
+<ol>
+<li>先完成 <code>20 × 5</code> 的 100 分块，验证数值和 tile 资源；</li>
+<li>再在 120 核目标分支中把 100 个块组织为直接 SPMD，或根据泳道图保留少量延迟块。</li>
+</ol>
+<p>第二步会改变调度关系，必须通过 <code>deps.json</code> 和四级芯片泳道图确认没有挤压更关键的早发任务。</p>
+<h4>2.5 Gate/Up/Down 保持 85</h4>
+<p>Gate 和 Up 当前为 <code>17 × 5 = 85</code> 个逻辑块；Down 也是 85 个逻辑块。它们已经能覆盖 120 核的大部分并行能力，继续翻倍会显著增加任务启动、权重读取和 Split-K/atomic 开销。第一版保持不变，只有泳道图显示单块时间过长且存在持续空核时再调。</p>
+<h3>3. DeepSeek CSA 方案</h3>
+<p>DeepSeek 按指定目标执行。重复出现的 <code>score 16 → 80</code> 只应用一次。</p>
+<p>默认规格为 <code>B=4</code>、<code>S=2</code>、<code>T=B×S=8</code>。</p>
+<details class="fold-table"><summary>展开：长表格（任务 / 调用次数 / 当前 BlockDim，共 12 行）</summary>
+<div class="table-wrap"><table class="data"><thead><tr><th>任务</th><th>调用次数</th><th>当前 BlockDim</th><th>目标 BlockDim</th><th>参数调整</th><th>切分 Batch</th></tr></thead><tbody><tr><td><code>qproj_matmul</code></td><td>1</td><td>64</td><td>128</td><td><code>QPROJ_MM_N_TILE: 512 → 256</code></td><td>否</td></tr><tr><td><code>qr_proj_matmul</code></td><td>1</td><td>16</td><td>64</td><td><code>QR_OK: 2 → 8</code></td><td>否</td></tr><tr><td><code>kv_proj_matmul</code></td><td>1</td><td>16</td><td>32</td><td><code>KV_OK: 4 → 8</code></td><td>否</td></tr><tr><td><code>idx_qr_proj_matmul</code></td><td>1</td><td>8</td><td>32</td><td><code>Q_OUT_TILE: 1024 → 256</code>，<code>MM_N_TILE: 512 → 256</code></td><td>否</td></tr><tr><td><code>idx_qr_proj_dequant</code></td><td>1</td><td>8</td><td>32</td><td>跟随 <code>Q_OUT_TILE</code></td><td>否</td></tr><tr><td><code>qr_hadamard_matmul</code></td><td>1</td><td>8</td><td>32</td><td><code>QH_MM_TILE: 64 → 16</code></td><td><strong>是</strong></td></tr><tr><td><code>score</code></td><td>1</td><td>16</td><td>80</td><td><code>REDUCE_NSPLIT: 2 → 10</code></td><td><strong>是</strong></td></tr><tr><td><code>qk_pv</code></td><td>1</td><td>24</td><td>40</td><td><code>NUM_QK_CORES: 24 → 40</code></td><td><strong>是</strong></td></tr><tr><td><code>proj_a_mm</code></td><td>8</td><td>8</td><td>16</td><td><code>PROJ_A_MM_N_TILE: 128 → 64</code></td><td>否</td></tr><tr><td><code>proj_b_mm</code></td><td>8</td><td>8</td><td>16</td><td><code>PROJ_B_D_TILE: 512 → 256</code></td><td>否</td></tr><tr><td><code>merge_norm</code></td><td>1</td><td>32</td><td>64</td><td>Merge Head tile：<code>16 → 8</code></td><td><strong>是</strong></td></tr><tr><td>主 compressor <code>kv_score_proj</code></td><td>1</td><td>16</td><td>64</td><td><code>OUT_TILE: 64 → 16</code></td><td>间接</td></tr></tbody></table></div>
+</details>
+<p>说明：<code>proj_a_mm</code> 和 <code>proj_b_mm</code> 的“8 × 16”表示各有 8 次调用、每次 BlockDim 16，不能直接等价为一次 BlockDim 128 的调用。</p>
+<h4>3.1 Batch 维度说明</h4>
+<ul>
+<li><code>qr_hadamard_matmul</code>：Block 索引为 <code>T × HeadTile</code>，包含 Batch/Token。</li>
+<li><code>score</code>：Block 索引为 <code>T × REDUCE_NSPLIT</code>，包含 Batch/Token 和 cache reduction split。</li>
+<li><code>qk_pv</code>：40 个逻辑工作项来自 <code>T × SPARSE_BLOCKS = 8 × 5</code>，明确包含 Batch/Token。</li>
+<li><code>merge_norm</code>：Block 索引为 <code>T × (H / MERGE_H_TILE)</code>，明确包含 Batch/Token。</li>
+<li><code>kv_score_proj</code>：BlockDim 公式含 <code>BS_PAD / MM_B_TILE</code> 行组，但默认 <code>T=8</code> 被装入一个 16 行物理 tile；本次 <code>16 → 64</code> 只通过缩小输出 N tile 实现，不新增 Batch 切分。</li>
+<li>其余 Matmul 任务都在每个 Block 内处理完整的默认 Token/Batch 行，新增并行度来自 N 或 Split-K。</li>
+</ul>
+<h4>3.2 <code>merge_norm 32 → 64</code> 的实现约束</h4>
+<p>不能直接把 <code>decode_sparse_attn_csa.py</code> 中共享的 <code>H_TILE</code> 从 16 改成 8。实际编译已经证明该直接修改会使 <code>qk_pv</code> 生成 <code>[8, 512]</code> FP32 Acc tile，而 PTO cube 物理行必须是 16 的整数倍；同时 8 个 FP32 标量只有 32 字节，多个 QK Block 写相邻区域时存在 64 字节 cache-line 共享风险。</p>
+<p>推荐把生产者和消费者 tile 解耦：</p>
+<pre class="lang-text"><code>QK_STORE_H_TILE = 16   # qk_pv 物理存储和 cache-line 粒度保持不变
+MERGE_H_TILE    = 8    # merge_norm 每个 Block 处理 8 个 Head</code></pre>
+<p><code>qk_pv</code> 继续按 16 Head 写满 64 字节的 <code>mi/li</code> 行组；两个 <code>merge_norm</code> Block 分别消费同一个 16-Head 组的前半和后半。这样可以得到 BlockDim 64，同时不引入 8 行 cube tile 和跨 Block cache-line 写冲突。该调整需要重写 <code>merge_norm</code> 的 producer-group/sub-group 索引，属于中等修改量。</p>
+<h4>3.3 其他主要风险</h4>
+<ul>
+<li><code>qproj_matmul 128</code>：120 核上会形成 <code>120 + 8</code> 的尾波；N tile 从 512 降到 256 后需要检查 GM/L1 搬运效率。</li>
+<li><code>qr_proj_matmul 64</code>：Split-K 从 2 增至 8，单 Block 更短，但 atomic-add 扇入扩大 4 倍。</li>
+<li><code>kv_proj_matmul 32</code>：Split-K 从 4 增至 8，存在相同的 atomic 竞争风险。</li>
+<li><code>idx_qr_proj_* 32</code>：<code>MM_N_TILE</code> 必须和 <code>Q_OUT_TILE</code> 一起降到 256，否则每个任务会覆盖相邻任务的输出范围。</li>
+<li><code>qr_hadamard_matmul 32</code>：M tile 从 64 降到 16，Hadamard 权重的重复读取比例上升。</li>
+<li><code>score 80</code>：每个 reduction lane 的有效 cache 工作量依赖序列长度，短序列可能出现大量短任务。</li>
+<li><code>qk_pv 40</code>：已经等于默认的 40 个有效工作项；继续增加 BlockDim 不会产生更多有效并行工作。</li>
+<li><code>kv_score_proj 64</code>：输出 tile 从 64 降到 16，单次写回很小，需要关注搬运效率和任务启动开销。</li>
+</ul>
+<h3>4. 实施与验证顺序</h3>
+<p>建议按以下顺序落地，避免一次修改过多后无法定位回退点：</p>
+<ol>
+<li>Qwen3 保持 Q/K/V 和 MLP 不变，只调整 Attention BlockDim。</li>
+<li>Qwen3 Out Projection 改为 <code>20 × 5</code>，先验证矩阵 tile，再调整直接/延迟任务比例。</li>
+<li>DeepSeek 先调整各 Matmul、Indexer、Score、QK 和 Compressor 参数。</li>
+<li>DeepSeek 单独实现 producer/store 与 <code>merge_norm</code> Head tile 解耦。</li>
+<li>每一步都使用仓库默认规格做编译和数值验证。</li>
+<li>在 120 核目标机采集 <code>deps.json</code> 与四级芯片泳道图，检查实际调度波次和关键路径。</li>
+</ol>
+<p>验收指标：</p>
+<ul>
+<li>默认规格数值测试通过；</li>
+<li>无 tile shape、L0C/L1/UB 超限或 cache-line 共享诊断；</li>
+<li><code>deps.json</code> 中任务依赖没有新增不必要的串行边；</li>
+<li>目标任务在 120 核泳道图中确实提高并发，而不是只增加短任务或尾波；</li>
+<li>端到端关键路径缩短，atomic 竞争和任务启动开销没有抵消收益；</li>
+<li>对所有标记为“切分 Batch”的任务，分别检查真实服务 Batch 和默认 Batch，决定是否需要单独的 Batch 配置档。</li>
+</ul>
+<h3>5. 当前验证状态</h3>
+<ul>
+<li>Qwen 已实现 Attention 120、Out <code>10 × 10</code>、Gate/Up 各 <code>17 × 5</code>；</li>
+</ul>
+<p>  Phase 0 与 Attention 通过 TaskId 连接，不再使用 <code>syncall</code>、dummy task 或</p>
+<p>  <code>sync_start</code>。</p>
+<ul>
+<li>DeepSeek 已实现表 3 的目标 BlockDim，并完成 <code>QK_STORE_H_TILE=16</code> 与</li>
+</ul>
+<p>  <code>MERGE_H_TILE=8</code> 的生产/消费解耦。</p>
+<ul>
+<li>Qwen 单层和 DeepSeek CSA 均在当前可用的 24 AIC/48 AIV 设备上通过</li>
+</ul>
+<p>  golden，同时在同一次 harness 调用中生成了 <code>deps.json</code> 和四级泳道图。</p>
+<ul>
+<li>当前采集用于验证依赖关系、实际重叠和数值正确性，不能替代 120 AIC</li>
+</ul>
+<p>  目标机性能验收。</p>
+<h3>6. 120 AIC 风险定量分析与采集结果</h3>
+<p>完整逐项分析以仓库内</p>
+<p><code>models/qwen3_deepseek_csa_5x_aicore_tiling.md</code> 的 3.3 节为准。关键结论如下：</p>
+<details class="fold-table"><summary>展开：长表格（任务 / 120 AIC 上的并行形态 / 风险判断与处理，共 8 行）</summary>
+<div class="table-wrap"><table class="data"><thead><tr><th>任务</th><th>120 AIC 上的并行形态</th><th>风险判断与处理</th></tr></thead><tbody><tr><td><code>qproj_matmul=128</code></td><td><code>120 + 8</code> 两波</td><td>输出互斥、无正确性风险；64/128 blocks 必须实测，最后 8 blocks 会影响 TaskId 完成。</td></tr><tr><td><code>qr_proj_matmul=64</code></td><td>一波，单任务占 53.3%</td><td>每个 N 区域 atomic 扇入 2→8，写回量约 4 倍；对比 Split-K 2/4/8。</td></tr><tr><td><code>kv_proj_matmul=32</code></td><td>一波，单任务占 26.7%</td><td>atomic 扇入 4→8，收益比 QR 更可疑；对比 Split-K 4/8。</td></tr><tr><td><code>idx_qr_proj_*=32</code></td><td>一波，单任务占 26.7%</td><td>正确性硬约束：<code>Q_OUT_TILE % MM_N_TILE == 0</code>、<code>MM_N_TILE &lt;= Q_OUT_TILE</code>，当前两者均为 256。</td></tr><tr><td><code>qr_hadamard_matmul=32</code></td><td>一波，单任务占 26.7%</td><td>M 64→16 后 Hadamard block 级读取约 256 KiB→1 MiB；对比 M=64/32/16。</td></tr><tr><td><code>score=80</code></td><td>一波，最多占 66.7%</td><td>每 token 有效 lane 为 <code>min(10, ceil(compressed_len/32))</code>；短/中/长 seq_len 必须分桶测试。</td></tr><tr><td><code>qk_pv=40</code></td><td>一波，占 33.3%</td><td>默认只有 <code>T×SPARSE_BLOCKS=8×5=40</code> 个工作项；仅增 BlockDim 无效。</td></tr><tr><td><code>kv_score_proj=64</code></td><td>一波，占 53.3%</td><td>N=16 为最窄 Cube tile，公共输入理论读取约 2 MiB→8 MiB；对比 N=64/32/16。</td></tr></tbody></table></div>
+</details>
+<p><code>score=80</code> 的长度敏感性可进一步量化为：原始可见长度不超过 128 时约</p>
+<p>8/80 blocks 有效，约 512 时 32/80 有效，约 1024 时 64/80 有效，约</p>
+<p>1156 以上才可能使 80 blocks 全部有效。</p>
+<h4>6.1 本次采集</h4>
+<div class="table-wrap"><table class="data"><thead><tr><th>样例</th><th>Golden</th><th>物理记录完整性</th><th>AIC 峰值</th><th>AIC 区间平均占用</th><th>AIV 峰值</th><th>AIV 区间平均占用</th></tr></thead><tbody><tr><td>Qwen 单层</td><td>PASS</td><td>857/857</td><td>24/24</td><td>82.5%</td><td>48/48</td><td>19.3%</td></tr><tr><td>DeepSeek CSA</td><td>PASS</td><td>1182/1182</td><td>24/24</td><td>40.4%</td><td>48/48</td><td>10.2%</td></tr></tbody></table></div>
+<p>Qwen 依赖图表明：Attention 单任务为 120 blocks；Out 的 10 个独立</p>
+<p><code>spmd(10)</code> 可同时暴露 100 blocks；Gate 与 Up 共 34 个 <code>spmd(5)</code> 在</p>
+<p>cast 完成后可暴露 170 blocks，120 AIC 上限为 120，后续 Down 可随各自</p>
+<p>SiLU 完成而流水启动。关闭 early dispatch 后，24 AIC 泳道中最大逻辑</p>
+<p>任务数为 24，对应 Gate/Up/Down 的 68 declared blocks，说明这三类任务</p>
+<p>仍有实际重叠；全图最大逻辑包络是 Attention 的 120 blocks。</p>
+<p>Qwen decode 和独立 paged-attention 路径已去掉 early dispatch。新生成的</p>
+<p><code>deps.json</code> 共 166 个逻辑任务，全部为 <code>early_dispatch=false</code>，任务数量、</p>
+<p>BlockDim 和显式依赖边均未改变。与此前允许 early dispatch 的独立采集</p>
+<p>相比，测试跨度从 874.76 us 变为 906.76 us，AIC 区间平均占用从 84.5%</p>
+<p>变为 82.5%；这两次结果来自 24 AIC 设备，包含运行波动，不能直接当作</p>
+<p>120 AIC 目标机的性能回退结论。</p>
+<p>DeepSeek CSA 已去掉 early dispatch、RMS 延迟 dummy、输出权重预取，以及</p>
+<p>QK/PV 非空块优先排序。70 个逻辑任务全部为 <code>early_dispatch=false</code>，无</p>
+<p>空 kernel 任务；QK/PV 按自然索引分配，BlockDim 仍为 40。<code>kv_touch</code> 的</p>
+<p>自拷贝用于 KV-cache 正确性依赖，继续保留。共享 helper 的修改也会影响</p>
+<p>其他调用者，本次实机验证覆盖 CSA decode。</p>
+<p>24 AIC 实测最大逻辑包络为 160 blocks：QR(64)+主 compressor(64)+KV(32)；</p>
+<p>后续 Q(128)+Indexer(32) 也有重叠。输出阶段最多同时有 6 个逻辑任务、</p>
+<p>96 blocks。八个独立 <code>proj_a_mm(16)</code> 静态上仍可提供 128 blocks。</p>
+<p><code>qr_hadamard=32</code>、<code>score=80</code>、<code>qk_pv=40</code> 仍是目标机可能欠填的阶段。</p>
+<p>本次 <code>x_out</code>、<code>kv_cache</code> 均通过 golden，跨度为 578.24 us；不能将其与</p>
+<p>旧版 548.70 us 的单次采集差值直接解释成 120 AIC 的性能变化。</p>
+<p>稳定归档位置：</p>
+<ul>
+<li><code>artifacts/qwen3_decode_5x_no_early_24core_capture/dfx_outputs/</code></li>
+<li><code>artifacts/deepseek_csa_5x_no_early_24core_capture/dfx_outputs/</code></li>
+</ul>
+<p>每个目录均包含 <code>deps.json</code>、<code>deps_viewer.html</code>、原始四级泳道记录、合并</p>
+<p>泳道图和 <code>concurrency_analysis.json</code>。必须在 120 AIC 目标机以相同命令</p>
+<p>重新采集，才能确认目标调度顺序、尾波和端到端 wall time。</p>
+</section>
+
+<section class="sec" id="doc-b">
+<h2>文档 B：120 AICore 静态分析与修改方案</h2>
+<div class="doc-banner">源文件：工作区根目录 <code>AICORE_5X_STATIC_ANALYSIS_CHANGE_PLAN.md</code>（中文原文）。</div>
+<h3>1. 结论</h3>
+<p>本方案后续修改以 <code>zhusy54/pypto-lib</code> 的 <code>aicore-5x-tiling</code> 分支</p>
+<p><code>4d6007c0fe529a1c0aa920c0e28d4be70f4af393</code> 为源码基线，只分析以下两个样例：</p>
+<ul>
+<li>Qwen3：<code>models/qwen3_14b/decode_fwd.py::_decode_layer</code></li>
+<li>DeepSeek CSA：<code>models/deepseek_v4_flash_mtp/decode_csa.py::attention_csa</code></li>
+</ul>
+<p>该分支已经完成第一版 120 AICore tiling：Qwen Attention 已设为120，Out Projection</p>
+<p>已设为100，DeepSeek CSA 的目标 tiling 也已落入源码。后续修改必须保留</p>
+<p><code>ATTN_SPMD_BLOCKS = 120</code> 和 <code>BATCH_PAD = 16</code>。不能通过把 Batch 从16改为24来制造</p>
+<p>192个 Attention 工作项，因为那会改变 benchmark 工作量，而不是只修改 tiling。</p>
+<p>私有工作镜像为 <code>yanghaoran29/pypto-lib-aicore-5x-tiling</code>，本地克隆目录为</p>
+<p><code>pypto-lib-aicore-5x-tiling-private</code>。其 <code>origin</code> 指向私有镜像，<code>upstream</code> 指向</p>
+<p><code>zhusy54/pypto-lib</code>，不会与 <code>hw-native-sys/pypto-lib</code> 的现有工作树和远端混淆。</p>
+<p>当前改造在保留全部逻辑 blocks 的前提下按数学依赖聚合任务：</p>
+<ol>
+<li>Out Projection 的100个 blocks 分成10个 <code>spmd(10)</code>；每组覆盖2个相邻 N tile</li>
+</ol>
+<p>   和5路 Split-K。</p>
+<ol>
+<li>Gate、Up 各自的85个 blocks 按 N tile 分成17个 <code>spmd(5)</code>；每组5个 block</li>
+</ol>
+<p>   完成同一个 N tile 的5路 Split-K。</p>
+<ol>
+<li>每个 SiLU tile 只依赖对应的 Gate TaskId、Up TaskId 和共享 RMS reduction；</li>
+</ol>
+<p>   Down 继续按 intermediate K slice 依赖对应 SiLU。</p>
+<ol>
+<li>DeepSeek 保留分支已有 tiling；<code>proj_a_mm/proj_b_mm</code> 的8次 group 流水不合并。</li>
+</ol>
+<h3>2. 基线与数据口径</h3>
+<p>后续分析和实现均使用新克隆的 <code>aicore-5x-tiling@4d6007c</code>。原</p>
+<p><code>pypto-lib</code> 工作树中的未提交实验不属于新基线，不应复制到私有镜像。</p>
+<p>依赖分析使用：</p>
+<ul>
+<li>Qwen3：<code>outputs/swimlane_qwen3_decode_layer/deps.json</code></li>
+<li>DeepSeek CSA：<code>artifacts/decode_csa/dfx_outputs/deps.json</code>（与 <code>outputs/artifacts_decode_csa/deps.json</code> 内容相同）</li>
+</ul>
+<p>没有使用 <code>artifacts/qwen3_decode_layer/dfx_outputs/deps.json</code>，因为它对应当前未提交实验，任务数和主线 tiling 不一致。主线 Qwen3 依赖图有 281 个任务节点、589 条任务间等待边；CSA 有 72 个任务节点、96 条去重后的任务间等待边。</p>
+<p>本文的并行度有两个口径：</p>
+<ul>
+<li>任务并行度：依赖 DAG 中互相不可达的任务调用数，即任务调用反链宽度。</li>
+<li>Block 并行度：将每个任务按 <code>block_num</code> 展开后得到的反链宽度。120 AICore 上实际并行度上限为 <code>min(Block 并行度, 120)</code>。</li>
+</ul>
+<p>反链只说明 <code>deps.json</code> 没有强制先后关系，不保证这些任务在真实时间线上一定重叠。任务时长、early dispatch、调度顺序、AIC/AIV 配比和内存带宽都会降低实际重叠。</p>
+<h3>3. Qwen3：已有120核实现与后续任务合并</h3>
+<h4>3.1 对比基线任务形态（<code>c3f0dea</code>）</h4>
+<details class="fold-table"><summary>展开：长表格（逻辑算子 / 主线任务调用 / 总 blocks，共 11 行）</summary>
+<div class="table-wrap"><table class="data"><thead><tr><th>逻辑算子</th><th>主线任务调用</th><th>总 blocks</th><th>说明</th></tr></thead><tbody><tr><td><code>q_proj</code></td><td>1</td><td>50</td><td><code>10 N × 5 split-K</code>，已是单个 SPMD</td></tr><tr><td><code>k_proj</code></td><td>1</td><td>10</td><td><code>2 N × 5 split-K</code>，已是单个 SPMD</td></tr><tr><td><code>v_proj</code></td><td>1</td><td>10</td><td><code>2 N × 5 split-K</code>，已是单个 SPMD</td></tr><tr><td><code>attn_swpipe</code></td><td>1</td><td>24</td><td>内部 grid-stride 处理 <code>active_batch × 8</code> 个工作项</td></tr><tr><td><code>out_proj</code></td><td>27</td><td>50</td><td>26 个普通任务 + 一个 24-block SPMD</td></tr><tr><td><code>residual_rms_cast</code></td><td>5</td><td>5</td><td>每个 K slice 一个普通任务</td></tr><tr><td><code>gate_proj</code></td><td>60</td><td>85</td><td>5 个 6-block SPMD + 55 个普通任务</td></tr><tr><td><code>up_proj</code></td><td>60</td><td>85</td><td>与 gate 相同</td></tr><tr><td><code>silu</code></td><td>17</td><td>17</td><td>每个 intermediate N tile 一个普通任务</td></tr><tr><td><code>down_proj</code></td><td>85</td><td>85</td><td><code>5 N × 17 K</code> 个普通任务</td></tr><tr><td><code>dcr_xgamma</code></td><td>1</td><td>5</td><td>已是单个 SPMD</td></tr></tbody></table></div>
+</details>
+<p><code>gate_proj_*</code> 等后缀来自同一逻辑算子的多次任务生成。它们不是不同数学算子。</p>
+<h4>3.2 当前任务聚合方案</h4>
+<p>逻辑 blocks 数量不变，只改变 TaskId 边界：</p>
+<details class="fold-table"><summary>展开：长表格（算子 / 任务组织 / block 映射，共 5 行）</summary>
+<div class="table-wrap"><table class="data"><thead><tr><th>算子</th><th>任务组织</th><th>block 映射</th><th>下游最小依赖</th></tr></thead><tbody><tr><td><code>out_proj</code></td><td>10个 <code>spmd(10)</code></td><td>每组 <code>2 N × 5 Split-K</code></td><td>每个1024列 residual slice依赖相邻2组</td></tr><tr><td><code>gate_proj</code></td><td>17个 <code>spmd(5)</code></td><td>每组 <code>1 N × 5 Split-K</code></td><td>对应 <code>silu[n]</code> 依赖1个 Gate TaskId</td></tr><tr><td><code>up_proj</code></td><td>17个 <code>spmd(5)</code></td><td>同 Gate</td><td>对应 <code>silu[n]</code> 依赖1个 Up TaskId</td></tr><tr><td><code>silu</code></td><td>17个单 block 任务</td><td>每个任务处理1个 intermediate N tile</td><td>依赖同一 n 的 Gate、Up及共享 RMS</td></tr><tr><td><code>down_proj</code></td><td>85个单 block 任务</td><td><code>5 output N × 17 intermediate K</code></td><td><code>down[o,n]</code> 只依赖 <code>silu[n]</code></td></tr></tbody></table></div>
+</details>
+<p>Out Projection 中，单组宽度为 <code>2 × 256 = 512</code>列；一个</p>
+<p><code>residual_rms_cast</code> slice为1024列，因此正好等待两组 Out TaskId。全局</p>
+<p><code>post_rms_reduce</code> 读取完整 Out 结果，仍需等待全部10组。</p>
+<p>Gate/Up 对固定的 intermediate tile <code>n</code> 分别计算：</p>
+<pre class="lang-text"><code>Gate[n] = sum(k=0..4, GatePartial[n,k])
+Up[n]   = sum(k=0..4, UpPartial[n,k])
+SiLU[n] = silu(Gate[n]) * Up[n]</code></pre>
+<p>所以 Gate 与 Up 互不依赖，但 <code>silu[n]</code> 必须等待两边各自5路 Split-K 完成。</p>
+<p>将每边5路放在一个 <code>spmd(5)</code> 后，<code>silu[n]</code> 的显式依赖由10个 partial TaskId</p>
+<p>收敛为2个 SPMD TaskId；它不等待其他16个 intermediate tile。</p>
+<h4>3.3 分支已落地的120核 tiling</h4>
+<h5>Attention：保留 120</h5>
+<p>修改文件：<code>models/qwen3_14b/paged_attention_pypto.py</code>。</p>
+<p>分支源码已经设置：</p>
+<pre class="lang-text"><code>ATTN_SPMD_BLOCKS = 120
+TRANSFER_ROWS = 120*3*16 = 5760</code></pre>
+<p>Phase 0 从 Attention mixed kernel 中拆成独立的 <code>spmd(16)</code>：每个 block 使用2个</p>
+<p>AIV lane，共32个 Phase-0 lanes。Attention 的 <code>spmd(120)</code> 依赖 Phase-0 TaskId，</p>
+<p>以任务边替代原来的 <code>syncall</code>。这样120个 Attention blocks 不需要同时驻留，也不会</p>
+<p>在 Q/K/V 写入完成前读取。</p>
+<p><code>TRANSFER_ROWS</code> 是派生值，代码可继续由公式计算，但所有函数签名和 scratch 创建点都必须随之重新编译。三块 transfer scratch 合计约从 3.94 MiB 增加到 19.69 MiB：</p>
+<ul>
+<li>score transfer：约 11.25 MiB；</li>
+<li>probability transfer：约 5.63 MiB；</li>
+<li>PV transfer：约 2.81 MiB。</li>
+</ul>
+<p>还需确认 <code>FFTS_WORKSPACE_ELEMENTS = 256</code> 是否满足目标 120-block mixed kernel 的运行时约束。它不能仅凭当前公式推定安全。</p>
+<p>Attention 的逻辑工作项为 <code>active_batch × NUM_KV_HEADS = 8B</code>。默认窗口上限</p>
+<p><code>B=16</code> 时是128项，120 lanes 中前8个 lane 各处理2项，其余112个 lane 各处理1项。</p>
+<p>原24 lanes 映射下，前8个 lane 各处理6项，其余16个 lane 各处理5项。只有</p>
+<p><code>B &gt;= 15</code> 才能填满120 lanes；小 Batch 会有空 lane。这里不修改模型 Batch 配置。</p>
+<p>默认单层 benchmark 使用 <code>seed=1234</code>，在 <code>[1, 4096]</code> 中生成以下16个固定长度：</p>
+<pre class="lang-text"><code>[2864, 724, 1319, 3126, 3277, 3445, 665, 2042,
+ 3728, 2738, 280, 1258, 3227, 31, 3756, 1183]</code></pre>
+<p>因此128个工作项数量固定，但耗时并不均等；同一 Batch 的8个 KV head 使用同一</p>
+<p><code>seq_len</code>。固定 seed 使各次 benchmark 可重复，不代表各工作项等长。</p>
+<h5>Out projection：50 → 100</h5>
+<p>修改文件：<code>models/qwen3_14b/decode_fwd.py</code>。</p>
+<pre class="lang-text"><code>N_SPLITS_OUT = 10 -&gt; 20
+K_SPLITS_OUT = 5  -&gt; 5
+OUT_TN       = 512 -&gt; 256
+OUT_TK       = 1024（不变）
+BlockDim     = 50 -&gt; 100</code></pre>
+<p>沿 N 切分可以保持 5 路 split-K atomic 扇入，避免把 atomic 竞争和累加顺序变化再放大。同步更新/复核：</p>
+<ul>
+<li><code>N_PER_CAST_K = MLP_K_SLICE // OUT_TN</code>：2 → 4；</li>
+<li>out seed 的 N 循环；</li>
+<li>所有 <code>N_SPLITS_OUT * K_SPLITS_OUT</code> 数组长度和断言；</li>
+<li>residual 与 out 的依赖在任务合并后应直接使用 TaskId，不再枚举 10 个 <code>out_tids</code>。</li>
+</ul>
+<p>Q/K/V 保持 50/10/10，gate/up/down 保持各 85 个逻辑 blocks，<code>x_gamma0/dcr_xgamma</code> 保持 5 blocks。Q/K/V 工作量约为 5:1:1，当前 50:10:10 已按工作量配平；只把 Q 改成 100 会留下 K/V 长尾。</p>
+<h4>3.4 Qwen3 并行度</h4>
+<p>主线 <code>deps.json</code> 的最大任务反链宽度为 141，最大 Block 反链宽度为 172，物理并行度上限为 120。172 的主要见证是 gate 85 + up 85 + post RMS 1；剩余 1 来自内部调度节点。任务反链 141 很大，主要是因为 gate/up/down 被拆成大量普通任务，不代表调度质量好。</p>
+<p>合并并应用目标 tiling 后，关键阶段的静态并行关系为：</p>
+<details class="fold-table"><summary>展开：长表格（阶段 / 可并行任务 / Block 并行度，共 7 行）</summary>
+<div class="table-wrap"><table class="data"><thead><tr><th>阶段</th><th>可并行任务</th><th>Block 并行度</th><th>120 核有效上限</th></tr></thead><tbody><tr><td>QKV projection</td><td>Q 50 + K 10 + V 10</td><td>70</td><td>70</td></tr><tr><td>Attention</td><td>一个任务</td><td>120；有效工作项为 <code>8B</code></td><td><code>min(120, 8B)</code></td></tr><tr><td>Out projection</td><td>10个任务</td><td>每个10，总计100</td><td>100</td></tr><tr><td>MLP projection</td><td>post RMS 1 + Gate 17 + Up 17</td><td>1 + 85 + 85 = 171</td><td>120</td></tr><tr><td>SiLU</td><td>17个任务</td><td>17</td><td>17</td></tr><tr><td>Down projection</td><td>85个任务</td><td>85</td><td>85</td></tr><tr><td>DCR/xgamma</td><td>一个任务</td><td>5</td><td>5</td></tr></tbody></table></div>
+</details>
+<p>全图在合并前后的理论 Block 反链上限都超过 120；此次修改的收益点是减少任务碎片，并让 attention/out 的单阶段并行度接近 120，而不是提高全图是否“存在 120 个可并行块”。</p>
+<h3>4. DeepSeek CSA 已落地方案</h3>
+<h4>4.1 decode 专用 tiling 先与共享路径解耦</h4>
+<p><code>qkv_proj_rope.py</code> 同时包含 decode 和 dense/prefill 路径。<code>QPROJ_MM_N_TILE</code>、<code>QR_OK</code> 被两条路径共用，不能直接全局替换。先拆成：</p>
+<pre class="lang-text"><code>DECODE_QPROJ_MM_N_TILE = 256
+DENSE_QPROJ_MM_N_TILE  = 512
+DECODE_QR_OK            = 8
+DENSE_QR_OK             = 2
+DECODE_KV_OK            = 8
+DENSE_KV_OK             = 2（保持主线）</code></pre>
+<p>并分别派生 K slice、断言和任务数。这样本次修改只改变 <code>attention_csa</code> 的 decode 路径，不连带改变 prefill 编译和性能。</p>
+<h4>4.2 目标 tiling 和修改位置</h4>
+<p>默认 <code>B=4</code>、<code>S=2</code>、<code>T=8</code>。</p>
+<details class="fold-table"><summary>展开：长表格（任务 / 主线 BlockDim / 目标 BlockDim，共 12 行）</summary>
+<div class="table-wrap"><table class="data"><thead><tr><th>任务</th><th>主线 BlockDim</th><th>目标 BlockDim</th><th>修改文件与参数</th><th>关键约束</th></tr></thead><tbody><tr><td><code>qproj_matmul</code></td><td>64</td><td>128</td><td><code>qkv_proj_rope.py</code>：decode N tile 512 → 256</td><td>保持 K=1024 不 split-K；N 输出互不重叠</td></tr><tr><td><code>qr_proj_matmul</code></td><td>16</td><td>64</td><td><code>qkv_proj_rope.py</code>：decode <code>QR_OK</code> 2 → 8</td><td>K slice 2048 → 512，每块 2 个 256-K 内循环；atomic 扇入 8</td></tr><tr><td><code>kv_proj_matmul</code></td><td>16</td><td>32</td><td><code>qkv_proj_rope.py</code>：decode <code>KV_OK</code> 4 → 8</td><td>K slice 1024 → 512；atomic 扇入 8</td></tr><tr><td><code>idx_qr_proj_matmul</code></td><td>8</td><td>32</td><td><code>decode_indexer.py</code>：<code>Q_OUT_TILE</code> 1024 → 256，<code>MM_N_TILE</code> 512 → 256</td><td>两值必须同步，防止任务输出范围重叠</td></tr><tr><td><code>idx_qr_proj_dequant</code></td><td>8</td><td>32</td><td>跟随 <code>Q_OUT_TILE</code></td><td>每块 dequant 256 列</td></tr><tr><td><code>qr_hadamard_matmul</code></td><td>8</td><td>32</td><td><code>decode_indexer.py</code>：<code>QH_MM_TILE</code> 64 → 16</td><td>16 是合法 cube M；Acc 从 32 KiB 降到 8 KiB</td></tr><tr><td><code>score</code></td><td>16</td><td>80</td><td><code>decode_indexer.py</code>：<code>REDUCE_NSPLIT</code> 2 → 10</td><td><code>T × 10 = 80</code>；短历史会产生空/短 lane</td></tr><tr><td><code>qk_pv</code></td><td>24</td><td>40</td><td><code>decode_sparse_attn_csa.py</code>：<code>NUM_QK_CORES</code> 24 → 40</td><td><code>QK_ITEMS = T × 5 = 40</code>，正好一 lane 一项</td></tr><tr><td><code>merge_norm</code></td><td>32</td><td>64</td><td>同上：新增 <code>MERGE_H_TILE = 8</code></td><td>生产存储粒度仍必须为 16 heads</td></tr><tr><td><code>proj_a_mm</code></td><td>8 次 × 8</td><td>8 次 × 16</td><td>同上：<code>PROJ_A_MM_N_TILE</code> 128 → 64</td><td>8 个 group 可并行，总 blocks 128</td></tr><tr><td><code>proj_b_mm</code></td><td>8 次 × 8</td><td>8 次 × 16</td><td>同上：<code>PROJ_B_D_TILE</code> 512 → 256</td><td><code>PROJ_B_MM_N_TILE=256</code> 保持</td></tr><tr><td>主 compressor <code>kv_score_proj</code></td><td>16</td><td>64</td><td><code>decode_compressor_ratio4.py</code>：<code>OUT_TILE</code> 64 → 16</td><td><code>16×16</code> cube tile合法，但搬运/启动开销需测量</td></tr></tbody></table></div>
+</details>
+<p><code>proj_a_mm -&gt; quant -&gt; proj_b_mm</code> 是每个 group 一条独立链。保留 8 个 group 调用可让 group 0 的 quant/proj_b 与后续 group 的 proj_a 重叠。若把 8 个 group 全部合成一个 128-block 任务，会引入全 group 屏障，因此不作为第一阶段任务合并项。</p>
+<h4>4.3 <code>merge_norm</code> 必须解耦生产和消费 tile</h4>
+<p>不能把现有共享的 <code>H_TILE=16</code> 直接改成 8。<code>qk_pv</code> 生产端用 16-head 存储粒度保证：</p>
+<ul>
+<li>cube 行数合法；</li>
+<li><code>mi/li</code> 的 16 个 FP32 元素正好 64 bytes；</li>
+<li>不会让两个 block 写同一 cache line。</li>
+</ul>
+<p>建议引入：</p>
+<pre class="lang-text"><code>QK_STORE_H_TILE = 16
+MERGE_H_TILE = 8</code></pre>
+<p>生产端 <code>sparse_blk_mi/li/oi</code> 的布局和 qk 子块写回继续按 16 heads。消费端 <code>merge_norm</code> 的 BlockDim 改为 <code>T * (H // MERGE_H_TILE) = 64</code>，block 解码和 <code>rope_swap_idx</code> 改按 8 heads。每两个 merge blocks 消费同一个 16-head producer group 的前半和后半。需要新增断言：</p>
+<pre class="lang-text"><code>QK_STORE_H_TILE % MERGE_H_TILE == 0
+H % QK_STORE_H_TILE == 0
+H % MERGE_H_TILE == 0</code></pre>
+<h4>4.4 CSA 并行关系和并行度</h4>
+<p>主线依赖图的最大任务反链宽度为 12，最大 Block 反链宽度为 128，因此在原 24 核机器上最多使用 24 AIC，在 120 核机器上仅从依赖角度最多可使用 120 AIC。主线 128-block 最大反链的一个见证由以下分支组成：</p>
+<pre class="lang-text"><code>qproj 64 + kv_proj 16 + main kv_score_proj 16
++ qr_rope 16 + inner kv_score_proj 8 + weights_proj 4
++ 4 个单-block 元数据/控制任务 = 128</code></pre>
+<p>按目标 tiling 替换 <code>block_num</code> 后，依赖 DAG 不变，理论最大 Block 反链宽度为 308，物理并行度仍为 120。一个 308-block 见证是：</p>
+<pre class="lang-text"><code>qproj_matmul 128
++ kv_proj_matmul 32
++ main kv_score_proj 64
++ score 80
++ comb_sinkhorn/csa_cmp_rope/q_rope_prepare/rope_cs 各 1
+= 308</code></pre>
+<p>关键可并行关系：</p>
+<ul>
+<li><code>qproj_matmul</code> 可与 <code>kv_proj_matmul</code>、主 compressor、indexer 的后续 score 分支并行；</li>
+<li><code>late_dep</code> 有意让 <code>qr_proj_matmul</code> 先发，随后才释放 kv projection、compressor 和 weights projection；</li>
+<li><code>score -&gt; topk -&gt; qk_plan</code> 与 Q/KV、cache/compressor 分支最终在 <code>qk_pv</code> 汇合；</li>
+<li><code>qk_pv -&gt; merge_norm</code> 串行；</li>
+<li>merge 后 8 条 <code>proj_a[g] -&gt; quant[g] -&gt; proj_b[g]</code> 可跨 group 并行，单个 proj_a 或 proj_b 波次共 128 blocks，120 核上形成 <code>120 + 8</code> 尾波。</li>
+</ul>
+<p>308 是依赖允许的理论上限。实际能否同时出现取决于不同分支的长度；不能据此声称运行时会长期满 120 核。目标机仍需用泳道图确认 qproj、score、compressor 等分支是否在时间上真正重叠。</p>
+<h3>5. <code>seq_len</code>、Batch 和其他任务变长因素</h3>
+<h4>5.1 Qwen3</h4>
+<p>只有 paged attention 的主计算随每个请求的 <code>seq_lens[b]</code> 明显增长：</p>
+<pre class="lang-text"><code>page_count  = ceil(seq_len / 128)
+stack_count = ceil(seq_len / 512)</code></pre>
+<p>每个 <code>(batch, kv_head)</code> 工作项执行 <code>stack_count + PRE_LAUNCH</code> 个 tick，QK/PV 总工作量近似与 <code>seq_len</code> 成正比。混合长短请求时，静态 grid-stride 映射会产生 lane 长尾；把 BlockDim 提高到 120 并不能消除这种长度不均衡。</p>
+<p>其他因素：</p>
+<ul>
+<li><code>active_batch</code> 改变 attention 的逻辑工作项数 <code>8B</code>，但 Q/K/V、out 和 MLP 都仍计算完整的 <code>BATCH_PAD=16</code> 行，因此它们的单 block 工作量不随真实 batch 下降。</li>
+<li>公共 batch 大于 16 时，<code>decode_fwd</code> 按 16 行 window 串行执行，端到端时间约随 <code>ceil(batch/16)</code> 增长。</li>
+<li><code>MAX_SEQ</code> 主要决定 KV pool、RoPE 表和 block table 的容量；真正决定本次 attention 循环长度的是运行时 <code>seq_lens[b]</code>。</li>
+</ul>
+<h4>5.2 DeepSeek CSA</h4>
+<p>CSA 的 decode <code>B=4</code>、<code>S=2</code>、<code>T=8</code> 是编译期配置。改变 B/S 会同时改变 <code>hc_pre</code>、Hadamard、score、qk、merge 和 output projection 的任务数及 tile 合法性，不能当成纯运行时扩容。</p>
+<p>历史长度对各任务的影响不同：</p>
+<details class="fold-table"><summary>展开：长表格（任务 / 长度来源 / 随历史长度变化，共 6 行）</summary>
+<div class="table-wrap"><table class="data"><thead><tr><th>任务</th><th>长度来源</th><th>随历史长度变化</th></tr></thead><tbody><tr><td><code>score</code></td><td><code>visible_len=min(kv_seq_lens/4, (position+1)/4, 4096)</code></td><td>明显增长；<code>cblk=ceil(visible_len/32)</code>，每 lane 约处理 <code>ceil(cblk/REDUCE_NSPLIT)</code> 页</td></tr><tr><td><code>topk</code></td><td>固定 <code>SCORE_LEN=4096</code></td><td><code>visible_len&gt;0</code> 后基本固定，始终对 4096 宽 scratch 做 sort/merge，只是无效尾部被 mask</td></tr><tr><td><code>qk_pv</code></td><td><code>WIN=128</code> + <code>CMP_TOPK=512</code></td><td>总工作项固定为 <code>T×5=40</code>；短历史时部分 compressed block 无效并走较短分支，历史足够长后 5 块趋于全有效；不会继续随长度无限增长</td></tr><tr><td>compressor pooling</td><td>当前 B/S、ratio=4 和 position 边界</td><td>是否跨压缩边界会改变分支，但每次处理的窗口有固定上限，不随总历史线性增长</td></tr><tr><td>RoPE/cache write</td><td>当前 T 和 position lookup</td><td>position 值只改变索引，主要工作量固定</td></tr><tr><td>Q/K/V、output projection</td><td>固定矩阵形状</td><td>与历史长度无关；随编译期 T 变化</td></tr></tbody></table></div>
+</details>
+<p>在最大可见历史 16384 token 时，indexer compressed 长度为 4096，<code>score</code> 有 128 个 32-row cache blocks。目标 <code>REDUCE_NSPLIT=10</code> 时，每 token 的 10 lanes 分到 12 或 13 个 block。短历史下 10-way split 会出现大量空 lane 和启动开销，应至少覆盖短、中、长三档长度验证。</p>
+<h3>6. 推荐实施顺序与验收</h3>
+<ol>
+<li>从干净的 <code>aicore-5x-tiling@4d6007c</code> 开始；不要带入原工作树实验。</li>
+<li>确认 Qwen Attention 保持120、<code>BATCH_PAD</code> 保持16、Out Projection 保持</li>
+</ol>
+<p>   <code>20×5=100</code>；确认 DeepSeek 的目标常量与第4节表格一致。</p>
+<ol>
+<li>在120核目标环境编译和验证，生成该分支对应的 <code>deps.json</code> 与泳道图。</li>
+<li>检查 Out 为10个 BlockDim-10任务，Gate/Up各为17个 BlockDim-5任务，且</li>
+</ol>
+<p>   <code>silu[n]</code> 只等待对应的 Gate/Up TaskId；不得用增加 Batch 的方式改变工作项数。</p>
+<ol>
+<li>检查任务名、调用数、BlockDim 和依赖边，并比较端到端墙钟时间。</li>
+</ol>
+<p>验收至少包括：</p>
+<ul>
+<li>Qwen 默认 batch 16，以及 batch 1/8/15/16 和大于 16 的多 window；</li>
+<li>Qwen 短/中/长并混合的 <code>seq_lens</code>，确认 attention lane 长尾；</li>
+<li>CSA 短、中、接近 16384 的 position/<code>kv_seq_lens</code>；</li>
+<li>数值、atomic 累加误差、L0C/L1/UB、GM scratch 容量和 cache-line 检查；</li>
+<li>新 <code>deps.json</code> 中 Out恰有10个 BlockDim-10任务，Gate/Up各恰有17个 BlockDim-5任务；</li>
+<li>Qwen decode样例不包含 dummy任务，Attention依赖独立 Phase-0 TaskId，且不存在</li>
+</ul>
+<p>  <code>syncall</code>；</p>
+<ul>
+<li>120 核泳道图中 attention=120、out=100、score=80、qk=40、merge=64，且端到端关键路径缩短；</li>
+<li>确认每个 SiLU 只等待对应 Gate/Up组，避免任务减少后引入全算子屏障。</li>
+</ul>
+</section>
+
+<section class="sec" id="doc-c">
+<h2>文档 C：Qwen3 / CSA 详版（中文译文）</h2>
+<div class="doc-banner">译自 <code>pypto-lib-aicore-5x-tiling-private/models/qwen3_deepseek_csa_5x_aicore_tiling.md</code>。与 A/B 有重叠表，按全文要求保留。</div>
+<p class="note">译自英文源：<code>pypto-lib-aicore-5x-tiling-private/models/qwen3_deepseek_csa_5x_aicore_tiling.md</code>。常量名、路径与任务名保留原文。</p>
+<h3>1. 目标与范围</h3>
+<p>本方案面向 AICore 数量由 24 增加到 120 的机器，保持仓库默认模型规格，不改隐藏维度、Head 数、Batch 上限或序列长度。</p>
+<ul>
+<li>Qwen3：<code>models/qwen3_14b/decode_fwd.py::_decode_layer</code></li>
+<li>DeepSeek CSA：<code>models/deepseek_v4_flash_mtp/decode_csa.py</code></li>
+<li>对比基线：<code>main</code> @ <code>c3f0dea274f55d9648920f17c968e8564ae9fcdc</code></li>
+<li>后续实现基线：<code>aicore-5x-tiling</code> @ <code>4d6007c0fe529a1c0aa920c0e28d4be70f4af393</code></li>
+</ul>
+<p>实现基线已包含 Qwen Attention 的 120-block launch。后续修改必须保留 <code>ATTN_SPMD_BLOCKS = 120</code> 与默认 <code>BATCH_PAD = 16</code>；增大 Batch 会改变 benchmark 工作量，不属于纯 tiling 改动。</p>
+<p>BlockDim 指一次任务调用启动的并行 block 数。普通 <code>pl.at</code> 的 BlockDim 为 1。逻辑分块总数描述某算子的全部工作块，这些块不一定同属一次调用，也不一定同时执行。</p>
+<p>Batch 切分标记：</p>
+<ul>
+<li><strong>是</strong>：block 索引显式包含 Batch 或 Token 维。</li>
+<li><strong>否</strong>：每个 block 处理完整 Batch tile；并行来自 N、K、Head 等非 Batch 维。</li>
+<li><strong>间接</strong>：表达式含行组，但本次不切该维；默认形状通常只有一个物理行组。</li>
+</ul>
+<h3>2. Qwen3 方案</h3>
+<h4>2.1 选定的 tiling</h4>
+<details class="fold-table"><summary>展开：长表格（任务 / 基线分块 / 目标分块，共 11 行）</summary>
+<div class="table-wrap"><table class="data"><thead><tr><th>任务</th><th>基线分块</th><th>目标分块</th><th>切分维度</th><th>切分 Batch</th><th>结论</th></tr></thead><tbody><tr><td><code>q_proj</code></td><td>50</td><td>50</td><td>N × Split-K：<code>10 × 5</code></td><td>否</td><td>保持</td></tr><tr><td><code>k_proj</code></td><td>10</td><td>10</td><td>N × Split-K：<code>2 × 5</code></td><td>否</td><td>保持</td></tr><tr><td><code>v_proj</code></td><td>10</td><td>10</td><td>N × Split-K：<code>2 × 5</code></td><td>否</td><td>保持</td></tr><tr><td><code>attn_swpipe_spmd</code></td><td>BlockDim 24</td><td>BlockDim 120</td><td>Batch × KV Head 工作项</td><td><strong>是</strong></td><td>调整</td></tr><tr><td><code>out_proj</code></td><td>50</td><td>10 个任务 × 10 = 100</td><td>每任务：<code>2 N × 5 Split-K</code></td><td>否</td><td>重组</td></tr><tr><td><code>gate_proj</code></td><td>85</td><td>17 个任务 × 5 = 85</td><td>每任务：<code>1 N × 5 Split-K</code></td><td>否</td><td>重组</td></tr><tr><td><code>up_proj</code></td><td>85</td><td>17 个任务 × 5 = 85</td><td>每任务：<code>1 N × 5 Split-K</code></td><td>否</td><td>重组</td></tr><tr><td><code>down_proj</code></td><td>85</td><td>85</td><td>N × K 分块</td><td>否</td><td>保持</td></tr><tr><td><code>x_gamma0</code></td><td>BlockDim 5</td><td>BlockDim 5</td><td>Hidden</td><td>否</td><td>保持</td></tr><tr><td><code>silu</code></td><td>17 个普通任务</td><td>17 个普通任务</td><td>Intermediate N</td><td>否</td><td>保持</td></tr><tr><td><code>dcr_xgamma</code></td><td>BlockDim 5</td><td>BlockDim 5</td><td>Hidden N</td><td>否</td><td>保持</td></tr></tbody></table></div>
+</details>
+<h4>2.2 保持 Q/K/V 为 50/10/10</h4>
+<p>Q、K、V 输出工作量约 5:1:1，现有 50:10:10 分块使单 block 工作量接近。</p>
+<p>若只把 Q 改成 100：</p>
+<ul>
+<li>Q 每 block 工作量减半，K/V 仍是更长任务；</li>
+<li><code>100 + 10 + 10 = 120</code> 只在数量上填满核数，并不均衡工作量；</li>
+<li>QKV 汇合点仍可能等 K/V 长尾；</li>
+<li>额外 Q block 可能挤占 K/V 的调度窗口。</li>
+</ul>
+<p>第一目标因此保持 50/10/10。仅当目标机泳道证明 Q 独立关键且 K/V 被完全隐藏时，再试 100/10/10。三者同比例扩到 100/20/20 共 140 blocks，在 120 核上必然第二波，不作默认。</p>
+<h4>2.3 Attention：24 → 120</h4>
+<p>修改位置：<code>models/qwen3_14b/paged_attention_pypto.py</code>。</p>
+<pre class="lang-text"><code>ATTN_SPMD_BLOCKS: 24 -&gt; 120</code></pre>
+<p>默认单个 Batch window 最多有：</p>
+<pre class="lang-text"><code>active_batch × NUM_KV_HEADS = 16 × 8 = 128 个逻辑工作项</code></pre>
+<p>BlockDim 120 时，前 8 个 lane 各执行两项，其余各一项。这显式切分 Batch × KV Head。active Batch 小于 15 时逻辑项不足 120，部分 AICore 会空闲。更大 Batch 应由服务负载决定，不能仅为填核。</p>
+<p><code>ATTN_SPMD_BLOCKS</code> 同时决定 transfer / workspace（含 <code>TRANSFER_ROWS</code>），只改 launch 维度不够。</p>
+<p>Phase 0 现为独立 BlockDim-16 任务，每 block 用 2 条 AIV，共 32 lanes。BlockDim-120 的 Attention 依赖 Phase-0 TaskId。该生产者-消费者边替代 mixed-kernel 的 <code>syncall</code>，保证 Q/K/V GM 交接顺序，且不要求 120 个 Attention block 同时驻留。Attention 无跨 block 同步、不请求 <code>sync_start</code>，可增量调度。</p>
+<h4>2.4 Benchmark 夹具</h4>
+<p>默认单层 benchmark：<code>BATCH=16</code>、<code>MAX_SEQ=4096</code>、<code>seed=1234</code>。生成其它随机张量前，为每行采样一个上下文长度：</p>
+<pre class="lang-text"><code>[2864, 724, 1319, 3126, 3277, 3445, 665, 2042,
+ 3728, 2738, 280, 1258, 3227, 31, 3756, 1183]</code></pre>
+<p>seed 保证可重复；长度不同使 128 个 <code>(batch, KV head)</code> 项耗时不等。旧 BlockDim 24：lane 0–7 各 6 项，8–23 各 5 项。BlockDim 120：lane 0–7 各 2 项，8–119 各 1 项。把 Batch 从 16 改到 24 会得到 192 项，必须当作独立工作量变化。</p>
+<h4>2.5 Out Projection：50 → 100</h4>
+<p>增大 N 切分，保持 Split-K：</p>
+<pre class="lang-text"><code>N_SPLITS_OUT: 10 -&gt; 20
+K_SPLITS_OUT: 5  -&gt; 5
+OUT_TN:       512 -&gt; 256
+OUT_TK:       1024（不变）
+合计:         10×5=50 -&gt; 20×5=100</code></pre>
+<p>选择理由：</p>
+<ul>
+<li>atomic-add 扇入保持 5，而非增到 10；</li>
+<li>限制 atomic 竞争与累加顺序精度风险；</li>
+<li><code>[BATCH_PAD, OUT_TN]</code> 累加器从 512 列降到 256 列；</li>
+<li>不切 Batch；每 block 仍处理完整 <code>BATCH_PAD</code>。</li>
+</ul>
+<p>基线把 50 个逻辑块组织为 26 个普通任务 + 一个直接 BlockDim-24 SPMD。第一版 120 核曾改为一次 100-block SPMD。当前分组为十个 BlockDim-10 任务：每任务覆盖两个相邻 256 列 N tile 与全部五路 Split-K。相邻两个 Out TaskId 正好产出一个 1024 列 <code>residual_rms_cast</code> slice，保留 slice 粒度释放，且不退回「一 block 一任务」。</p>
+<h4>2.6 按输出 tile 聚合 Gate / Up</h4>
+<p>Gate 与 Up 各保留 <code>17 × 5 = 85</code> 逻辑块。对 17 个 intermediate N tile，各有一个 Gate <code>spmd(5)</code> 与一个 Up <code>spmd(5)</code> 计算五路 Split-K partial。Gate 与 Up 互不依赖。对应 SiLU tile 只等三个 TaskId：共享 RMS reduction、其 Gate SPMD、其 Up SPMD；不等待另外 16 个输出 tile。</p>
+<p>Down 保留 85 逻辑块。每个 Down Split-K block 仍只依赖产生其 intermediate K slice 的那一个 SiLU，保留 17 路 Gate/Up/SiLU→Down 流水。</p>
+<h3>3. DeepSeek CSA 方案</h3>
+<p>DeepSeek 按指定目标执行。重复的 <code>score 16 → 80</code> 只应用一次。</p>
+<p>默认形状：<code>B=4</code>、<code>S=2</code>、<code>T=B×S=8</code>。</p>
+<details class="fold-table"><summary>展开：长表格（任务 / 调用次数 / 基线 BlockDim，共 12 行）</summary>
+<div class="table-wrap"><table class="data"><thead><tr><th>任务</th><th>调用次数</th><th>基线 BlockDim</th><th>目标 BlockDim</th><th>参数调整</th><th>切分 Batch</th></tr></thead><tbody><tr><td><code>qproj_matmul</code></td><td>1</td><td>64</td><td>128</td><td><code>QPROJ_MM_N_TILE: 512 → 256</code></td><td>否</td></tr><tr><td><code>qr_proj_matmul</code></td><td>1</td><td>16</td><td>64</td><td><code>QR_OK: 2 → 8</code></td><td>否</td></tr><tr><td><code>kv_proj_matmul</code></td><td>1</td><td>16</td><td>32</td><td><code>KV_OK: 4 → 8</code></td><td>否</td></tr><tr><td><code>idx_qr_proj_matmul</code></td><td>1</td><td>8</td><td>32</td><td><code>Q_OUT_TILE: 1024 → 256</code>，<code>MM_N_TILE: 512 → 256</code></td><td>否</td></tr><tr><td><code>idx_qr_proj_dequant</code></td><td>1</td><td>8</td><td>32</td><td>跟随 <code>Q_OUT_TILE</code></td><td>否</td></tr><tr><td><code>qr_hadamard_matmul</code></td><td>1</td><td>8</td><td>32</td><td><code>QH_MM_TILE: 64 → 16</code></td><td><strong>是</strong></td></tr><tr><td><code>score</code></td><td>1</td><td>16</td><td>80</td><td><code>REDUCE_NSPLIT: 2 → 10</code></td><td><strong>是</strong></td></tr><tr><td><code>qk_pv</code></td><td>1</td><td>24</td><td>40</td><td><code>NUM_QK_CORES: 24 → 40</code></td><td><strong>是</strong></td></tr><tr><td><code>proj_a_mm</code></td><td>8</td><td>8</td><td>16</td><td><code>PROJ_A_MM_N_TILE: 128 → 64</code></td><td>否</td></tr><tr><td><code>proj_b_mm</code></td><td>8</td><td>8</td><td>16</td><td><code>PROJ_B_D_TILE: 512 → 256</code></td><td>否</td></tr><tr><td><code>merge_norm</code></td><td>1</td><td>32</td><td>64</td><td>Merge Head tile：<code>16 → 8</code></td><td><strong>是</strong></td></tr><tr><td>主 compressor <code>kv_score_proj</code></td><td>1</td><td>16</td><td>64</td><td><code>OUT_TILE: 64 → 16</code></td><td>间接</td></tr></tbody></table></div>
+</details>
+<p><code>proj_a_mm</code> / <code>proj_b_mm</code> 的「8 × 16」表示八次调用、每次 BlockDim 16，不等价于一次 BlockDim-128。</p>
+<h4>3.1 Batch 维细节</h4>
+<ul>
+<li><code>qr_hadamard_matmul</code>：索引为 Token × HeadTile。</li>
+<li><code>score</code>：Token × cache reduction split。</li>
+<li><code>qk_pv</code>：40 项 = <code>T × SPARSE_BLOCKS = 8 × 5</code>。</li>
+<li><code>merge_norm</code>：<code>T × (H / MERGE_H_TILE)</code>。</li>
+<li><code>kv_score_proj</code>：BlockDim 含 <code>BS_PAD / MM_B_TILE</code> 行组表达式，但默认 8 token 装入一个 16 行物理 tile；16→64 仅靠缩小输出 N tile。</li>
+<li>其余 matmul 每 block 处理完整默认 Token/Batch 行；新并行来自 N 或 Split-K。</li>
+</ul>
+<h4>3.2 Merge Norm：32 → 64</h4>
+<p>不能把共享 Head tile 直接从 16 改成 8：会生成非法 <code>[8, 512]</code> FP32 cube 累加器（物理 cube 行须为 16 的倍数）；8 个 FP32 仅 32 字节，相邻 QK block 可能共享 64 字节 cache line。</p>
+<p>因此解耦生产/消费 tile：</p>
+<pre class="lang-text"><code>QK_STORE_H_TILE = 16  # QK/PV 物理存储与 cache-line 粒度
+MERGE_H_TILE    = 8   # 每个 merge_norm block 消费的 Head 数</code></pre>
+<p>QK/PV 继续写 16 Heads 并填满 64 字节 <code>mi/li</code> 组；两个 <code>merge_norm</code> block 分别消费每个 16-Head 组的下半与上半。得到 BlockDim 64，且不引入 8 行 cube tile 或跨 block cache-line 写。</p>
+<h4>3.3 主要风险</h4>
+<p>目标机有 120 个物理 AIC。某任务的 BlockDim 是其自身最大并行度，不是全图利用率：独立就绪任务可共享机器。因此需要目标机 <code>deps.json</code> 与四级泳道，才能区分「孤立的低 BlockDim」与「真实空闲区间」。</p>
+<details class="fold-table"><summary>展开：长表格（任务 / 120 AIC 波次 / 占用 / 风险类型，共 8 行）</summary>
+<div class="table-wrap"><table class="data"><thead><tr><th>任务</th><th>120 AIC 波次 / 占用</th><th>风险类型</th><th>所需决策</th></tr></thead><tbody><tr><td><code>qproj_matmul=128</code></td><td><code>120 + 8</code></td><td>尾波性能</td><td>在关键路径上对比 64 与 128 blocks</td></tr><tr><td><code>qr_proj_matmul=64</code></td><td>一波，53.3%</td><td>atomic 竞争与 FP32 顺序</td><td>对比 Split-K 2 / 4 / 8</td></tr><tr><td><code>kv_proj_matmul=32</code></td><td>一波，26.7%</td><td>atomic 竞争</td><td>在其并发阶段对比 Split-K 4 / 8</td></tr><tr><td><code>idx_qr_proj_*=32</code></td><td>一波，26.7%</td><td>tile 不一致则正确性</td><td>强制输出 tile 不变量</td></tr><tr><td><code>qr_hadamard_matmul=32</code></td><td>一波，26.7%</td><td>权重重复搬运</td><td>对比 M tile 64 / 32 / 16</td></tr><tr><td><code>score=80</code></td><td>一波，最多 66.7%</td><td>随序列长度浪费</td><td>短/中/长上下文分开测</td></tr><tr><td><code>qk_pv=40</code></td><td>一波，33.3%</td><td>工作项上限</td><td>除非重切 Head，否则保持 40</td></tr><tr><td><code>kv_score_proj=64</code></td><td>一波，53.3%</td><td>窄 N 搬运与 setup</td><td>对比 N tile 64 / 32 / 16</td></tr></tbody></table></div>
+</details>
+<h5><code>qproj_matmul=128</code>：规则 tile + 八 block 尾波</h5>
+<p>输出宽 <code>64 heads × 512 = 32768</code>。256 列 tile 下，128 个 block 写互不重叠的 <code>[16, 256]</code> INT32 区、无 atomic，故数值安全。但在 120 AIC 上，下游要等第二波 8 个 block 完成后才能看到 TaskId 完成。旧 64-block 用 512 列 tile、每 block 约两倍工作。理想线性缩放下，一波 64 与两半波 128 孤立计算时间相近，新布局还付尾调度成本。<code>32768 / 120</code> 不是整 Cube tile，故无法均匀 120 路切分。64 vs 128 是经验关键路径选择，不能单从 BlockDim 推出。</p>
+<h5><code>qr_proj_matmul=64</code> 与 <code>kv_proj_matmul=32</code>：Split-K 扇入</h5>
+<p><code>qr_proj_matmul</code> 有八个 128 列 N 组与八路 K split；同组八个 partial atomic-add 到同一 <code>[16, 128]</code> FP32 区。Split-K 2→8 使 K slice 缩短 4 倍，同时 atomic 写流量与扇入 ×4。64 blocks 可同波驻留 120 AIC，每区八个写者可能同时活跃；累加顺序也可能改 FP32 低位。</p>
+<p><code>kv_proj_matmul</code> 有四个 128 列 N 组与八路 K；扇入 4→8，BlockDim 仅 16→32。它不在主 Q 路径上，可与其它就绪分支重叠，故 26.7% 孤立占用不等于整机空闲。仅当目标泳道显示并发阶段更短且 atomic 尾不更大时，才保留 Split-K 8。</p>
+<h5><code>idx_qr_proj_*=32</code>：输出所有权是硬不变量</h5>
+<p>Indexer 输出宽 <code>64 × 128 = 8192</code>。<code>Q_OUT_TILE=256</code> 给出 32 个互斥任务区；<code>MM_N_TILE=256</code> 使每任务恰好一次匹配 Cube 写。若 <code>MM_N_TILE &gt; Q_OUT_TILE</code>，相邻任务重叠。当前取相等；一般安全条件：</p>
+<pre class="lang-text"><code>Q_OUT_TILE % MM_N_TILE == 0
+MM_N_TILE &lt;= Q_OUT_TILE
+(IDX_N_HEADS * IDX_HEAD_DIM) % Q_OUT_TILE == 0</code></pre>
+<p>Matmul 与 dequant 必须继续使用同一 <code>Q_OUT_TILE</code> 划分。这是正确性要求，不是性能旋钮。</p>
+<h5><code>qr_hadamard_matmul=32</code>：更多并行行，权重重复读</h5>
+<p>行数 <code>T × IDX_N_HEADS = 8 × 64 = 512</code>。M tile 64→16 使 BlockDim 8→32，每 block 行工作量降为 1/4。每 block 仍读完整 <code>[128, 128]</code> BF16 Hadamard（32 KiB）。块级权重读合计约从 256 KiB 增到 1 MiB。cache 复用可减 HBM 流量，但去不掉重复 GM→L1 与 Cube setup。用 AIC busy、MTE2 busy 与任务墙钟对比 M=64/32/16。</p>
+<h5><code>score=80</code>：有效 lane 依赖序列长度</h5>
+<p>80 blocks = <code>T=8</code> × <code>REDUCE_NSPLIT=10</code>。一个 reduction tile 为 <code>BLOCK_SIZE / COMPRESS_RATIO = 128 / 4 = 32</code> 压缩 token，故每 token 有效 lane：</p>
+<pre class="lang-text"><code>min(10, ceil(visible_compressed_length / 32))</code></pre>
+<p>原始可见长度 ≤128 时约 8/80 有用；约 512 时 32 有用；约 1024 时 64 有用；约 1156 以上才可能 80 全有用。零迭代 lane 不改正值但仍有调度成本。产品决策需分短/中/长上下文测量；短序列桶或宜 <code>REDUCE_NSPLIT=2</code> 或 4。</p>
+<h5><code>qk_pv=40</code>：当前分解只有 40 项</h5>
+<p>默认形状恰好 <code>T × SPARSE_BLOCKS = 8 × 5 = 40</code> 独立项。只增 <code>NUM_QK_CORES</code> 会产生零迭代 lane。按 Head 再切可暴露更多并行，但当前项把一块 sparse KV 收进 L1 并在 Head 组间复用；Head 切分会重复 gather 并需改结果布局或 merge。除非测过该算法改动，否则保持 40。</p>
+<h5><code>kv_score_proj=64</code>：最窄 Cube 列 tile</h5>
+<p>主 ratio-4 compressor：一个 pad 后的 16 行组投影到 1024 列。N tile 64→16 使 BlockDim 16→64。权重区仍互斥、总字节不变，但公共 <code>[16, 4096]</code> 输入被 64 个 block 消费（原 16）。无 cache 复用时输入流量约 2 MiB→8 MiB。N=16 也是最小 Cube 列 tile，固定 setup/transfer 更难摊销。这是一次 SPMD launch 而非 64 次 kernel，但每 block 仍付自己的 setup。目标机对比 N=64/32/16。</p>
+<h5>目标机验收标准</h5>
+<ol>
+<li>把 Indexer 输出 tile 关系当作编译期正确性不变量。</li>
+<li>测量 <code>qproj</code> 在 64 与 128 blocks；检查八 block 尾是否拉长图关键路径。</li>
+<li>扫 QR Split-K 2/4/8 与 KV Split-K 4/8，同时看墙钟与数值漂移。</li>
+<li>扫 Hadamard M 64/32/16 与 compressor N 64/32/16。</li>
+<li>在代表性服务序列长度上测 score，而非只测最长夹具。</li>
+<li>除非重设计 Head 分解，保持 <code>qk_pv=40</code>。</li>
+<li>只以端到端目标机墙钟接受 tiling；BlockDim 或核忙碌改善只是解释性指标，不是加速本身。</li>
+</ol>
+<h3>4. 验证要求</h3>
+<p>用仓库默认形状验证每个模型：</p>
+<ol>
+<li>通过 PyTorch golden。</li>
+<li>无 tile shape、L0C/L1/UB 溢出或 cache-line 共享诊断。</li>
+<li>确认 <code>deps.json</code> 未引入不必要串行依赖。</li>
+<li>用四级目标机泳道证明任务真正并发，而非只造更多短任务或新尾波。</li>
+<li>在 120 核机上测端到端关键路径时延。</li>
+<li>对每个切分 Batch 的任务，单独测真实服务 Batch，再决定是否改 Batch 配置。</li>
+</ol>
+<h3>5. 当前验证状态</h3>
+<ul>
+<li>Qwen Q/K/V 与 MLP tiling 未改。</li>
+<li>Qwen Out Projection 为十个 BlockDim-10 SPMD。</li>
+<li>Qwen Gate/Up 各为 17 个 BlockDim-5 SPMD；每个 SiLU 只等匹配的 Gate/Up 与 RMS reduction。</li>
+<li>Qwen Phase 0 为独立 BlockDim-16 生产者；Attention 仍为 BlockDim 120，依赖 Phase-0 TaskId，无 <code>syncall</code>。</li>
+<li>Qwen decode 样例无 dummy；消费者直接依赖真实生产者或无效初始 scratch carry。</li>
+<li>Qwen decode 与独立 paged-attention 不请求 early dispatch；捕获图全部 166 个逻辑任务 <code>early_dispatch=false</code>。</li>
+<li>含 BlockDim-120 Attention 的完整 Qwen 布局可在 <code>a2a3sim</code> 编译；生成 orchestration 含 10 Out、17 Gate、17 Up SPMD，无 dummy、无 <code>syncall</code>。</li>
+<li>完整 Qwen 布局在 <code>a2a3</code> device 1 上通过默认单层 golden（Attention BlockDim 120）。</li>
+<li>DeepSeek 实现全部目标 BlockDim（含解耦的 QK 存储与 Merge Norm 消费），并在 <code>a2a3</code> device 1 通过默认 golden。</li>
+<li>尚无 120 核目标机性能结果。</li>
+</ul>
+<h4>5.1 新依赖与四级泳道采集</h4>
+<p>两次样例在同一次 harness 调用中启用依赖生成与四级芯片泳道。运行时两次 device pass：第一次生成 <code>deps.json</code>，第二次采集无依赖插桩的干净 timing。</p>
+<pre class="lang-bash"><code>python models/qwen3_14b/decode_fwd.py -p a2a3 -d "$DEVICE" \
+  --enable-chip-swimlane 4 --enable-dep-gen \
+  --dep-output-dir "$QWEN_CAPTURE"
+
+python models/deepseek_v4_flash_mtp/decode_csa.py -p a2a3 -d "$DEVICE" \
+  --enable-chip-swimlane 4 --enable-dep-gen \
+  --dep-output-dir "$CSA_CAPTURE"</code></pre>
+<p>可用采集设备为 24 AIC / 48 AIV（见各 <code>chip_swimlane_records.json</code>），不是 120 AIC 目标。下表证明图结构、实际重叠与数值正确性；不能预测目标机墙钟。</p>
+<div class="table-wrap"><table class="data"><thead><tr><th>样例</th><th>Golden</th><th>拼接物理行</th><th>AIC 峰值</th><th>AIC 区间平均占用</th><th>AIV 峰值</th><th>AIV 区间平均占用</th><th>采集测试跨度</th></tr></thead><tbody><tr><td>Qwen 单层</td><td>Pass</td><td>857 / 857</td><td>24 / 24</td><td>82.5%</td><td>48 / 48</td><td>19.3%</td><td>906.76 us</td></tr><tr><td>DeepSeek CSA</td><td>Pass</td><td>1182 / 1182</td><td>24 / 24</td><td>40.4%</td><td>48 / 48</td><td>10.2%</td><td>578.24 us</td></tr></tbody></table></div>
+<p>平均占用覆盖该核类型从首到末 kernel 的区间，含有意只用另一类核的阶段。它解释采集，不是端到端加速指标。</p>
+<p>Qwen 产物：</p>
+<ul>
+<li><code>../artifacts/qwen3_decode_5x_no_early_24core_capture/dfx_outputs/deps.json</code></li>
+<li><code>../artifacts/qwen3_decode_5x_no_early_24core_capture/dfx_outputs/deps_viewer.html</code></li>
+<li><code>../artifacts/qwen3_decode_5x_no_early_24core_capture/dfx_outputs/chip_swimlane_records.json</code></li>
+<li><code>../artifacts/qwen3_decode_5x_no_early_24core_capture/dfx_outputs/merged_swimlane_20260914_093942.json</code></li>
+<li><code>../artifacts/qwen3_decode_5x_no_early_24core_capture/dfx_outputs/concurrency_analysis.json</code></li>
+</ul>
+<p>DeepSeek 产物：</p>
+<ul>
+<li><code>../artifacts/deepseek_csa_5x_no_early_24core_capture/dfx_outputs/deps.json</code></li>
+<li><code>../artifacts/deepseek_csa_5x_no_early_24core_capture/dfx_outputs/deps_viewer.html</code></li>
+<li><code>../artifacts/deepseek_csa_5x_no_early_24core_capture/dfx_outputs/chip_swimlane_records.json</code></li>
+<li><code>../artifacts/deepseek_csa_5x_no_early_24core_capture/dfx_outputs/merged_swimlane_20260914_185837.json</code></li>
+<li><code>../artifacts/deepseek_csa_5x_no_early_24core_capture/dfx_outputs/concurrency_analysis.json</code></li>
+</ul>
+<h4>5.2 Qwen 并发分析</h4>
+<p>新依赖图确认阶段级并发意图：</p>
+<details class="fold-table"><summary>展开：长表格（阶段 / 依赖可见的 AIC 工作 / 120 AIC 解读，共 5 行）</summary>
+<div class="table-wrap"><table class="data"><thead><tr><th>阶段</th><th>依赖可见的 AIC 工作</th><th>120 AIC 解读</th></tr></thead><tbody><tr><td>Q/K/V projection</td><td>Q 50、K 10、V 10</td><td>独立投影分支可重叠；合计声明 70 blocks</td></tr><tr><td>Attention</td><td>120</td><td>恰好一整波目标机；Phase 0 为独立 16-block AIV 任务</td></tr><tr><td>Out Projection</td><td>10 个独立任务 × 10 = 100</td><td>十任务仅共享 Attention 前驱，可暴露 100 AIC blocks（目标的 83.3%）</td></tr><tr><td>Gate + Up</td><td>17×5 + 17×5 = 170</td><td>五个 cast 生产者喂给每个 Gate/Up；cast 完成后可填满 120 AIC，另 50 blocks 进后波</td></tr><tr><td>Down</td><td>85 个单 block 任务</td><td>每五路组跟随各自 SiLU，可与未完成的 Gate/Up 流水</td></tr></tbody></table></div>
+</details>
+<p>24 AIC 采集上物理 AIC 并发达 24。Attention 形成最大观测逻辑包络（120 声明 blocks）。最大同时逻辑任务数为 24、声明 68 blocks（Gate/Up/Down 流水），确认关闭 early dispatch 后五 block Gate/Up 与单 block Down 仍重叠。</p>
+<p>相对此前允许 early dispatch 的采集，测试跨度 874.76→906.76 us，AIC 区间占用 84.5%→82.5%。这是 24 AIC 上的分次运行，含噪声，不是目标机回退测量。它显示预期调度效应：消费者现等正常生产者完成，而任务数、BlockDim 与显式边不变。</p>
+<p>本采集需去掉 Attention 过时的 <code>sync_start</code> 请求。Phase 0 已通过 TaskId 提供全局 Q/K/V 交接；Attention 无跨 block 同步。BlockDim 仍为 120。目标机上增量派发也允许其它就绪工作在 AIC 空闲时立即占用，而不要求 120 个 AIC 同时空闲。</p>
+<h4>5.3 DeepSeek 并发分析</h4>
+<p>本采集中 CSA 使用普通依赖调度。70 个逻辑任务全部 <code>early_dispatch=false</code>；无空 kernel 列表。RMS 延迟 dummy 换成 RMS 生产者 TaskId；去掉输出权重预取；QK/PV 按自然 token/block 序，无非空优先规划。独立 helper 包装用无效 TaskId 而非空 dummy。无 <code>sync_start</code> / <code>syncall</code>。</p>
+<p><code>kv_touch</code> 自拷贝保留，因其提供必需 KV-cache 依赖。Split-K atomics、显式生产者边与核内流水仍实现选定计算。共享 helper 也影响其它调用者；本采集只验证 CSA decode。</p>
+<p>24 AIC 泳道达到满物理 AIC 占用。最大逻辑 AIC 包络 160 声明 blocks：QR projection(64)、主 compressor projection(64)、KV projection(32)。随后 Q projection(128) 与 Indexer projection(32) 重叠，亦暴露 160。输出阶段最多六个同时逻辑任务、96 blocks（跨 <code>proj_a_mm</code>/<code>proj_b_mm</code>）；八个独立 <code>proj_a_mm(16)</code> 在 Merge Norm 后静态可暴露 128 blocks。</p>
+<p>投影分支因此可在目标机上供给超过 120 blocks。它们在真实依赖完成后争用资源，无人为延迟优先 QR。<code>qproj_matmul=128</code> 的八 block 尾仍需目标机测量。</p>
+<p>本采集在 device 0 通过 <code>x_out</code> 与 <code>kv_cache</code>。记录跨度 578.24 us，对比更早带调度优化的 548.70 us。那是 24 AIC 上分次插桩运行，不是受控 120 AIC 性能对比。物理行 1183→1182 因去掉 prefetch kernel；去掉 dummy 降低逻辑任务数但不去掉物理计算行。</p>
+<p>后续 attention 阶段固有并发更低，在捕获的 AIC 包络中较孤立：</p>
+<div class="table-wrap"><table class="data"><thead><tr><th>阶段</th><th>声明 AIC blocks</th><th>120 AIC 上限</th><th>后果</th></tr></thead><tbody><tr><td><code>qr_hadamard_matmul</code></td><td>32</td><td>26.7%</td><td>本采集中无独立 AIC 工作与之重叠</td></tr><tr><td><code>score</code></td><td>80</td><td>66.7%</td><td>短序列时有效有用 blocks 可能更低</td></tr><tr><td><code>qk_pv</code></td><td>40</td><td>33.3%</td><td>当前 <code>T × SPARSE_BLOCKS</code> 分解无额外项</td></tr><tr><td>八个 <code>proj_a_mm</code> 任务</td><td>128</td><td>100% + 8-block 尾</td><td>Merge Norm 后八个输出组独立</td></tr></tbody></table></div>
+<p>图在早期投影扇出与分组输出投影中有足够工作填满 120 AIC。目标机上可能欠填的区域是 Hadamard、短上下文的 score、以及 QK/PV。仍强制要求新的 120 AIC 四级采集：24 AIC timing 会改变重叠形态，不能确立目标调度顺序或墙钟。</p>
+</section>
+
+<footer class="page-foot">
+<p>本页归档于 Scheduler <code>doc/tiling/aicore_5x_tiling.html</code>。可跑样例与上板产物见 <a href="../../samples/v200/README.md">samples/v200</a>；离线 120 核泳道生成见仓库根 <a href="../../README.md#怎么生成-sim120">README · sim120</a>。</p>
+</footer>
+</div>
+</body>
+</html>

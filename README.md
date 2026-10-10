@@ -17,6 +17,8 @@
 
 叶子细节与上板脚本见 [samples/v200/README.md](samples/v200/README.md)。工具链钉扎见 [samples/v200/VERSIONS.md](samples/v200/VERSIONS.md)。样例文档与结构图见 [doc/cases/README.md](doc/cases/README.md) 和 [doc/cases/capture_cases.html](doc/cases/capture_cases.html)。
 
+5× AICore 切分方案 / 静态分析 / 详版风险（含「分块数字怎么算」）见 [doc/tiling/aicore_5x_tiling.html](doc/tiling/aicore_5x_tiling.html)。
+
 ## 目录地图
 
 | 路径 | 作用 |
@@ -28,6 +30,7 @@
 | `workloads/` | 冻结的 `deps.json` / swimlane / `manifest.json` |
 | `samples/v200/` | 四档 PyPTO + Simpler 样例与上板产物 |
 | `tools/` | capture 生成、sim120 重排、依赖图 |
+| `doc/tiling/` | 5× AICore tiling 文档合集 HTML |
 | `tests/` | header / SPMD 展开单测 |
 
 ## 怎么生成 sim120
