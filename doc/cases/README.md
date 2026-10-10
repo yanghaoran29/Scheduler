@@ -2,6 +2,8 @@
 
 本目录描述 [`cases/`](../../cases/) 里 painter 接口用的静态 DAG 样例。
 
+**文档唯一入口**：[../decode_serving_handbook.html](../decode_serving_handbook.html)。本目录的 [capture_cases.html](capture_cases.html) 为历史生成页 / 附录，不再作为对外入口。
+
 ## `cases/` vs `cases2/`
 
 | 目录 | 接口 | 说明 |

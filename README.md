@@ -15,9 +15,9 @@
 | `deepseek_v4_flash_csa/basic_batch4_mtp1` | `deepseek_v4_csa_lt` |
 | `deepseek_v4_flash_csa/ht_batch20_mtp3` | `deepseek_v4_csa_ht` |
 
-叶子细节与上板脚本见 [samples/v200/README.md](samples/v200/README.md)。工具链钉扎见 [samples/v200/VERSIONS.md](samples/v200/VERSIONS.md)。样例文档与结构图见 [doc/cases/README.md](doc/cases/README.md) 和 [doc/cases/capture_cases.html](doc/cases/capture_cases.html)。
+叶子细节与上板脚本见 [samples/v200/README.md](samples/v200/README.md)。工具链钉扎见 [samples/v200/VERSIONS.md](samples/v200/VERSIONS.md)。
 
-5× AICore 切分方案 / 静态分析 / 详版风险（含「分块数字怎么算」）见 [doc/tiling/aicore_5x_tiling.html](doc/tiling/aicore_5x_tiling.html)。
+**文档唯一入口**：[doc/decode_serving_handbook.html](doc/decode_serving_handbook.html)（Decode 服务负载手册：依赖图 / 粒度 / 时序 / Capture SPMD / AscendC）。由仓库内 `V200-benchmark/gen_html.py` 生成。`doc/cases/capture_cases.html`、`doc/tiling/aicore_5x_tiling.html`、`doc/scheduler_analysis.html` 等为生成源或附录，不再作为对外入口。
 
 ## 目录地图
 
@@ -30,7 +30,8 @@
 | `workloads/` | 冻结的 `deps.json` / swimlane / `manifest.json` |
 | `samples/v200/` | 四档 PyPTO + Simpler 样例与上板产物 |
 | `tools/` | capture 生成、sim120 重排、依赖图 |
-| `doc/tiling/` | 5× AICore tiling 文档合集 HTML |
+| `doc/decode_serving_handbook.html` | 唯一对外 HTML 手册 |
+| `doc/tiling/` | 5× tiling 附录（非手册入口） |
 | `tests/` | header / SPMD 展开单测 |
 
 ## 怎么生成 sim120
